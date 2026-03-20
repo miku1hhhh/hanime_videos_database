@@ -1,0 +1,46 @@
+name: Crawl Hanime Data
+
+on:
+  schedule:
+    # 每天北京时间凌晨 3 点运行（UTC 时间 19:00）
+    - cron: '0 19 * * *'
+  workflow_dispatch:   # 允许手动触发
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 最大运行时间 6 小时（GitHub Actions 限制）
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install aiohttp aiosqlite beautifulsoup4 lxml
+          # 如果需要代理，取消下面一行的注释并设置环境变量 SOCKS5_PROXY
+          # pip install aiohttp_socks
+
+      - name: Run crawler
+        env:
+          # 如果使用代理，通过 GitHub Secrets 设置 SOCKS5_PROXY
+          SOCKS5_PROXY: ${{ secrets.SOCKS5_PROXY }}
+        run: python crawler.py
+
+      - name: Upload database artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hanime-videos-db
+          path: hanime_videos.db
+          retention-days: 7   # 保留最近 7 天的数据库文件
+
+      - name: Upload log artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawler-log
+          path: crawler.log
+          retention-days: 7
