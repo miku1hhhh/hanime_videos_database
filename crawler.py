@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-异步爬虫（GitHub Actions 版）
-抓取 https://www.hanime163.top/watch?v={vid} 的标题、描述、关键词
-存储到 SQLite 数据库，支持断点续爬、代理、随机延迟
+两阶段异步爬虫 - 抓取 https://www.hanime163.top/watch?v={vid} 的视频信息
+并自动检测 hanime2.top 的最新 VID，实现动态范围扩展。
+支持 SOCKS5 代理、完整浏览器头、智能重试、断点续爬。
 """
 
 import os
@@ -11,8 +11,8 @@ import asyncio
 import json
 import logging
 import random
-import sqlite3
-from typing import Dict, Optional
+import re
+from typing import Dict, Optional, Set
 
 import aiohttp
 import aiosqlite
@@ -28,14 +28,16 @@ except ImportError:
     print("提示: 如需使用 SOCKS5 代理，请安装: pip install aiohttp_socks")
 
 # ==================== 配置区域 ====================
-BASE_URL = "https://www.hanime163.top/watch?v={}"
-VID_RANGE = (1, 405056)             # 可根据需要调整起始和结束
-CONCURRENT_TASKS = 3                # 并发数（GitHub Actions 中建议 3~5）
+BASE_URL = "https://www.hanime163.top/watch?v={}"          # 原网站
+SEARCH_URL = "https://www.hanime2.top/search?sort=最新上市"  # 获取最新 VID 的搜索页
+DEFAULT_MAX_VID = 405056                                   # 预定义范围的最大 VID
+
+CONCURRENT_TASKS = 70      # 并发数（GitHub Actions 建议 3~5）
 REQUEST_TIMEOUT = 20
-RETRY_TIMES = 5
-MIN_DELAY = 2
-MAX_DELAY = 5
-DB_FILE = "hanime_videos.db"        # 数据库文件名
+RETRY_TIMES = 3
+MIN_DELAY = 0.5              # 随机延迟最小值（秒）
+MAX_DELAY = 1.5              # 随机延迟最大值（秒）
+DB_FILE = "hanime_videos.db"
 
 # SOCKS5 代理（通过环境变量配置，如 SOCKS5_PROXY="socks5://user:pass@ip:port"）
 SOCKS5_PROXY = os.environ.get("SOCKS5_PROXY", None)
@@ -60,7 +62,8 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
 ]
 
-def generate_headers() -> dict:
+def generate_headers(referer: str = "https://www.hanime163.top/") -> dict:
+    """生成完整的浏览器请求头，referer 可根据目标网站调整"""
     return {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -77,10 +80,10 @@ def generate_headers() -> dict:
         "Sec-Fetch-Site": "none",
         "Sec-Fetch-User": "?1",
         "Priority": "u=0, i",
-        "Referer": "https://www.hanime163.top/",
+        "Referer": referer,
     }
 
-# ==================== 数据库初始化（不含 sources 字段） ====================
+# ==================== 数据库初始化 ====================
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS videos (
     vid INTEGER PRIMARY KEY,
@@ -99,10 +102,44 @@ async def init_db() -> aiosqlite.Connection:
     await conn.commit()
     return conn
 
-async def get_existing_vids(conn: aiosqlite.Connection) -> set:
+async def get_existing_vids(conn: aiosqlite.Connection) -> Set[int]:
+    """获取数据库中已存在的所有 VID"""
     async with conn.execute("SELECT vid FROM videos") as cursor:
         rows = await cursor.fetchall()
         return {row[0] for row in rows}
+
+async def get_max_vid(conn: aiosqlite.Connection) -> int:
+    """获取数据库中最大的 VID"""
+    async with conn.execute("SELECT MAX(vid) FROM videos") as cursor:
+        row = await cursor.fetchone()
+        return row[0] if row[0] else 0
+
+# ==================== 获取最新 VID（从 hanime2.top 搜索页） ====================
+async def get_latest_vid(session: aiohttp.ClientSession) -> Optional[int]:
+    """
+    从搜索页获取当前最新的 VID。
+    返回第一个视频的 vid 数字，失败返回 None。
+    """
+    headers = generate_headers(referer="https://www.hanime2.top/")
+    try:
+        async with session.get(SEARCH_URL, headers=headers, timeout=15) as resp:
+            if resp.status == 200:
+                html = await resp.text()
+                # 在 HTML 中查找第一个 /watch?v=数字 的链接
+                match = re.search(r'/watch\?v=(\d+)', html)
+                if match:
+                    vid = int(match.group(1))
+                    logger.info(f"从搜索页获取到最新 VID: {vid}")
+                    return vid
+                else:
+                    logger.error("未在搜索页找到视频链接，可能页面结构已变")
+                    return None
+            else:
+                logger.error(f"搜索页返回状态码 {resp.status}")
+                return None
+    except Exception as e:
+        logger.error(f"获取最新 VID 失败: {e}")
+        return None
 
 # ==================== HTML 解析（不提取 sources） ====================
 def parse_html(html: str, vid: int) -> Optional[Dict]:
@@ -117,7 +154,6 @@ def parse_html(html: str, vid: int) -> Optional[Dict]:
     meta_keys = soup.find('meta', attrs={'name': 'keywords'})
     keywords = meta_keys.get('content', '').strip() if meta_keys else None
 
-    # 只要有标题或描述之一即认为有效
     if title or description:
         return {
             'vid': vid,
@@ -129,7 +165,7 @@ def parse_html(html: str, vid: int) -> Optional[Dict]:
         logger.warning(f"VID {vid}: 页面缺少关键信息，可能无效")
         return None
 
-# ==================== 抓取单个 VID（含重试） ====================
+# ==================== 抓取单个 VID ====================
 async def fetch_vid(session: aiohttp.ClientSession, vid: int, semaphore: asyncio.Semaphore) -> Optional[Dict]:
     url = BASE_URL.format(vid)
     await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
@@ -164,8 +200,13 @@ async def fetch_vid(session: aiohttp.ClientSession, vid: int, semaphore: asyncio
     return None
 
 # ==================== 工作协程 ====================
-async def worker(queue: asyncio.Queue, session: aiohttp.ClientSession,
-                 db_conn: aiosqlite.Connection, semaphore: asyncio.Semaphore, stats: dict):
+async def worker(
+    queue: asyncio.Queue,
+    session: aiohttp.ClientSession,
+    db_conn: aiosqlite.Connection,
+    semaphore: asyncio.Semaphore,
+    stats: dict
+):
     while True:
         try:
             vid = await queue.get()
@@ -193,29 +234,41 @@ async def worker(queue: asyncio.Queue, session: aiohttp.ClientSession,
             logger.exception(f"Worker 处理 VID {vid} 时发生异常: {e}")
             queue.task_done()
 
-# ==================== 主函数 ====================
-async def main():
-    db_conn = await init_db()
+# ==================== 核心爬取函数 ====================
+async def crawl_range(start_vid: int, end_vid: int, db_conn: aiosqlite.Connection,
+                      session: aiohttp.ClientSession, semaphore: asyncio.Semaphore,
+                      stats: dict) -> None:
+    """爬取指定 VID 范围（包括两端）"""
+    # 获取已存在的 VID 集合，避免重复
     existing_vids = await get_existing_vids(db_conn)
-    logger.info(f"数据库已有 {len(existing_vids)} 条记录")
-
     queue = asyncio.Queue()
     total_new = 0
-    for vid in range(VID_RANGE[0], VID_RANGE[1] + 1):
+    for vid in range(start_vid, end_vid + 1):
         if vid not in existing_vids:
             await queue.put(vid)
             total_new += 1
-    logger.info(f"待爬取新 VID 数量: {total_new}")
 
     if total_new == 0:
-        logger.info("没有新 VID 需要处理，退出")
-        await db_conn.close()
+        logger.info(f"范围 {start_vid}-{end_vid} 内无新 VID，跳过")
         return
 
-    semaphore = asyncio.Semaphore(CONCURRENT_TASKS)
-    stats = {'succeeded': 0, 'failed': 0}
+    logger.info(f"待爬取新 VID 数量: {total_new} (范围 {start_vid}-{end_vid})")
 
-    # 代理处理
+    workers = [asyncio.create_task(worker(queue, session, db_conn, semaphore, stats))
+               for _ in range(CONCURRENT_TASKS)]
+
+    await queue.join()
+    for _ in workers:
+        await queue.put(None)
+    await asyncio.gather(*workers, return_exceptions=True)
+
+# ==================== 主函数 ====================
+async def main():
+    db_conn = await init_db()
+    max_vid_in_db = await get_max_vid(db_conn)
+    logger.info(f"数据库中最大 VID: {max_vid_in_db}")
+
+    # 创建 HTTP 连接器（代理处理）
     proxy_url = SOCKS5_PROXY
     if proxy_url and SOCKS_SUPPORT:
         if not proxy_url.startswith(('socks5://', 'socks5h://')):
@@ -230,16 +283,40 @@ async def main():
         logger.info("使用直连（无代理）")
         connector = aiohttp.TCPConnector(limit=CONCURRENT_TASKS * 2, ssl=False)
 
+    semaphore = asyncio.Semaphore(CONCURRENT_TASKS)
+    stats = {'succeeded': 0, 'failed': 0}
+
     async with aiohttp.ClientSession(connector=connector) as session:
-        workers = [asyncio.create_task(worker(queue, session, db_conn, semaphore, stats))
-                   for _ in range(CONCURRENT_TASKS)]
+        # 获取当前最新 VID
+        latest_vid = await get_latest_vid(session)
+        if latest_vid is None:
+            logger.error("无法获取最新 VID，退出")
+            await db_conn.close()
+            return
 
-        await queue.join()
-        for _ in workers:
-            await queue.put(None)
-        await asyncio.gather(*workers, return_exceptions=True)
+        # 确定本次爬取范围
+        if max_vid_in_db < DEFAULT_MAX_VID:
+            # 首次运行：先爬预定义范围 1-DEFAULT_MAX_VID
+            logger.info(f"首次运行或数据库最大 VID 小于 {DEFAULT_MAX_VID}，先爬预定义范围 1-{DEFAULT_MAX_VID}")
+            await crawl_range(1, DEFAULT_MAX_VID, db_conn, session, semaphore, stats)
 
-    logger.info(f"爬取完成，成功: {stats['succeeded']}，失败: {stats['failed']}")
+            # 预定义范围爬完后，更新数据库最大 VID
+            max_vid_in_db = await get_max_vid(db_conn)
+            logger.info(f"预定义范围爬取后，数据库最大 VID: {max_vid_in_db}")
+
+        # 如果数据库最大 VID 已经达到或超过 DEFAULT_MAX_VID，则爬取新增部分
+        if max_vid_in_db >= DEFAULT_MAX_VID:
+            start_vid = max_vid_in_db + 1
+            end_vid = latest_vid
+            if start_vid <= end_vid:
+                logger.info(f"增量爬取范围 {start_vid}-{end_vid}")
+                await crawl_range(start_vid, end_vid, db_conn, session, semaphore, stats)
+            else:
+                logger.info("没有新增 VID，增量部分跳过")
+        else:
+            logger.info(f"数据库最大 VID {max_vid_in_db} 尚未达到预定义终点，本次未进行增量爬取")
+
+    logger.info(f"本次运行完成，成功: {stats['succeeded']}，失败: {stats['failed']}")
     await db_conn.close()
 
 if __name__ == "__main__":
